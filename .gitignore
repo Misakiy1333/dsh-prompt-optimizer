@@ -26,3 +26,8 @@ desktop.ini
 *.bak
 .bak-*
 .smoke.cjs
+
+# Local verification harness
+.verify-*.cjs
+node_modules/
+pnpm-lock.yaml
