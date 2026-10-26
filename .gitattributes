@@ -1,0 +1,14 @@
+# Normalize to LF in the repository; check out native on Windows.
+* text=auto eol=lf
+
+# Explicit types for tooling.
+*.js   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.svg  text eol=lf
+
+# Binary
+*.png  binary
+*.jpg  binary
+*.webp binary

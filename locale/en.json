@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "title": "Prompt Optimizer",
+    "description": "One button in the composer rewrites what you typed into a clearer prompt and puts it back into the input box."
+  },
+  "button": {
+    "idle": "Improve prompt",
+    "busy": "Improving…",
+    "done": "Improved",
+    "tip": "Rewrite the current draft as a structured prompt (does not send)",
+    "tipBusy": "Rewriting the current draft…",
+    "tipDone": "Filled back into the composer; keep editing before you send",
+    "empty": "The composer is empty — write a line first.",
+    "tooLong": "Draft is longer than 6000 characters; trim it first.",
+    "noSession": "Open a session first.",
+    "noRoute": "This session has no model route yet.",
+    "failed": "Optimization failed"
+  }
+}
