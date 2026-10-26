@@ -25,3 +25,4 @@ desktop.ini
 *.local
 *.bak
 .bak-*
+.smoke.cjs
