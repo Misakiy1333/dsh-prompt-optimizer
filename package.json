@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-optimizer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Composer button for DeepSeek Harness that rewrites the current draft into a structured prompt and puts it back into the input box.",
   "type": "module",
   "license": "MIT",
