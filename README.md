@@ -59,7 +59,7 @@ You type a rough request, click the button, and the draft becomes a scaffolded p
 ## 安装 / Install
 
 ```bash
-git clone https://github.com/<your-name>/dsh-prompt-optimizer.git
+git clone https://github.com/Misakiy1333/dsh-prompt-optimizer.git
 ```
 
 然后在 Harness 里安装本地目录：
