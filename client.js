@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
     const CELL = 'prompt-optimizer';
     /** Drafts above this size are refused instead of rewritten. */
     const MAX_DRAFT = 6000;
-    /** How long a transient state stays visible. */
+    /** How long a transient state stays visible after a rewrite. */
     const FLASH_MS = 2400;
 
     /* ── copy ─────────────────────────────────────────────────────────────── */
@@ -18,23 +18,29 @@ window.__ModuleLoader__.load({
     const COPY = {
       zh: {
         idle: '优化提示词',
+        busy: '优化中…',
         done: '已优化',
-        tip: '把当前输入改写成结构化提示词（只改草稿，不发送）',
+        tip: '用当前模型把草稿改写成结构化提示词（只改草稿，不发送）',
         tipDone: '已填回输入框，发送前可以继续改',
         empty: '输入框是空的，先写一句再点优化',
         tooLong: '草稿超过 6000 字，先精简一下',
         noSession: '先进入一个会话再优化',
+        noRoute: '当前会话还没有模型路由，先选一个模型',
         trivial: '这句太短，像答复而不是指令；写清要做什么再优化',
+        failed: '优化失败',
       },
       en: {
         idle: 'Improve prompt',
+        busy: 'Improving…',
         done: 'Improved',
-        tip: 'Rewrite the current draft as a structured prompt (edits the draft, does not send)',
+        tip: 'Rewrite the draft as a structured prompt with the current model (edits the draft, does not send)',
         tipDone: 'Filled back into the composer; keep editing before you send',
         empty: 'The composer is empty — write a line first',
         tooLong: 'Draft is longer than 6000 characters; trim it first',
         noSession: 'Open a session first',
+        noRoute: 'This session has no model route yet — pick a model first',
         trivial: 'Too short to be an instruction — say what you want done, then retry',
+        failed: 'Optimization failed',
       },
     };
 
@@ -44,208 +50,26 @@ window.__ModuleLoader__.load({
       return id.startsWith('zh') ? COPY.zh : COPY.en;
     }
 
-    /* ── local rewrite engine (no imports, no network) ────────────────────── */
+    /* ── local fallback (used when no model route resolves) ───────────────── */
 
-    /** Split a draft into sentence-ish fragments, keeping list markers separate. */
-    function fragments(text) {
-      return text
-        .split(/\n+/u)
-        .map((line) => line.trim())
-        .filter((line) => line !== '')
-        .flatMap((line) => {
-          // Keep an explicit list item as one unit; split prose on terminator marks.
-          if (/^([-*•·]|\d+[.、)])\s+/.test(line)) return [line.replace(/^([-*•·]|\d+[.、)])\s+/, '')];
-          return line
-            .split(/(?<=[。！？；])|(?<=[.!?;])\s+/u)
-            .map((part) => part.trim())
-            .filter((part) => part !== '');
-        });
-    }
-
-    /** Detect the draft language so the rewritten prompt matches it. */
-    function languageOf(text) {
-      const cjk = (text.match(/[\u4e00-\u9fff]/gu) ?? []).length;
-      const latin = (text.match(/[A-Za-z]/gu) ?? []).length;
-      return cjk >= latin ? 'zh' : 'en';
-    }
-
-    /** Cues that mark a fragment as a constraint rather than the main goal. */
-    const CONSTRAINT_CUES_ZH = ['要', '需要', '必须', '不要', '别', '不能', '支持', '适配', '兼容', '用', '基于', '限制', '注意', '确保', '保证'];
-    const CONSTRAINT_CUES_EN = ['must', 'should', 'need', 'needs', 'required', "don't", 'do not', 'avoid', 'without', 'support', 'using', 'use', 'based on', 'ensure', 'make sure'];
-
-    /** Question-like openers that mean the goal is a question, not a build task. */
-    const QUESTION_CUES_ZH = ['为什么', '怎么', '如何', '什么', '哪里', '哪个', '是否', '能不能', '可不可以'];
-    const QUESTION_CUES_EN = ['why', 'how', 'what', 'where', 'which', 'whether', 'can ', 'could ', 'is it', 'does '];
-
-    /** A task verb list used to decide whether the draft asks for output or an answer. */
-    const TASK_CUES_ZH = ['写', '做', '生成', '实现', '创建', '改', '优化', '设计', '分析', '检查', '修复', '重构', '翻译', '总结', '对比', '解释'];
-    const TASK_CUES_EN = ['write', 'build', 'create', 'implement', 'make', 'generate', 'refactor', 'design', 'analyse', 'analyze', 'review', 'fix', 'translate', 'summarise', 'summarize', 'compare', 'explain'];
-
-    function hasAny(text, cues) {
-      const lower = text.toLowerCase();
-      return cues.some((cue) => lower.includes(cue));
-    }
-
-    /**
-     * Bare acknowledgements and conversational filler. These answer the previous
-     * turn; they are not instructions, so wrapping them in a prompt scaffold
-     * only adds noise.
-     */
+    /** Bare acknowledgements are answers, not instructions. */
     const TRIVIAL = [
-      'ok', 'okay', 'k', 'yes', 'no', 'sure', 'thanks', 'thank you', 'thx', 'got it', 'yep', 'nope',
+      'ok', 'okay', 'k', 'yes', 'no', 'sure', 'thanks', 'thankyou', 'thx', 'gotit', 'yep', 'nope',
       '好', '好的', '好吧', '行', '可以', '嗯', '哦', '收到', '了解', '明白了', '懂了', '谢谢', '多谢',
       '继续', '接着来', '再来', '对', '是的', '不是', '没问题', '辛苦了', 'ok了', '好了',
     ];
 
-    /** True when the draft carries no instruction worth restructuring. */
     function isTrivial(text) {
-      const compact = text
-        .toLowerCase()
-        .replace(/[\s。！？!?.,，、~～…—-]+/gu, '');
+      const compact = text.toLowerCase().replace(/[\s。！？!?.,，、~～…—-]+/gu, '');
       if (compact === '') return true;
-      // Nothing beyond a couple of acknowledgement characters.
-      if (compact.length <= 4) {
-        return TRIVIAL.some((word) => {
-          const w = word.replace(/[\s。！？!?.,，、~～…—-]+/gu, '');
-          return w !== '' && compact === w;
-        });
-      }
-      return TRIVIAL.includes(compact);
-    }
-
-    /** Classify the draft so the generated scaffold matches its real intent. */
-    function classify(text) {
-      const zh = languageOf(text) === 'zh';
-      const isQuestion = hasAny(text, zh ? QUESTION_CUES_ZH : QUESTION_CUES_EN);
-      const isTask = hasAny(text, zh ? TASK_CUES_ZH : TASK_CUES_EN);
-      if (isQuestion && !isTask) return 'question';
-      if (isTask) return 'task';
-      return 'open';
-    }
-
-    /** True when a fragment reads like a constraint or requirement. */
-    function isConstraint(fragment, zh) {
-      if (/^([-*•·]|\d+[.、)])/.test(fragment)) return true;
-      return hasAny(fragment, zh ? CONSTRAINT_CUES_ZH : CONSTRAINT_CUES_EN);
-    }
-
-    /** Headings per intent and language. */
-    const HEADINGS = {
-      zh: {
-        goal: '## 目标',
-        context: '## 背景',
-        requirements: '## 要求',
-        constraints: '## 约束',
-        output: '## 输出要求',
-      },
-      en: {
-        goal: '## Goal',
-        context: '## Context',
-        requirements: '## Requirements',
-        constraints: '## Constraints',
-        output: '## Output',
-      },
-    };
-
-    /** Output contracts per intent. */
-    const OUTPUT_RULES = {
-      zh: {
-        question: [
-          '- 先直接回答问题，再展开理由',
-          '- 不确定的地方明确标注，不要编造',
-          '- 需要引用事实时给出依据来源',
-        ],
-        task: [
-          '- 直接给出可用的结果，不要复述本提示词',
-          '- 结论先行，必要的推理过程放在结论之后',
-          '- 完整可运行/可直接使用，不要留 TODO 占位',
-          '- 不确定的地方明确标注，不要编造',
-        ],
-        open: [
-          '- 先确认你的理解，再给出结果',
-          '- 不确定的地方明确标注，不要编造',
-          '- 若有多种可行方案，列出并说明取舍',
-        ],
-      },
-      en: {
-        question: [
-          '- Answer the question first, then give the reasoning',
-          '- Flag anything uncertain instead of inventing it',
-          '- Cite the basis when you state a fact',
-        ],
-        task: [
-          '- Give the finished result directly; do not restate this prompt',
-          '- Lead with the conclusion; keep supporting reasoning after it',
-          '- Complete and runnable — leave no TODO placeholders',
-          '- Flag anything uncertain instead of inventing it',
-        ],
-        open: [
-          '- State your understanding before the result',
-          '- Flag anything uncertain instead of inventing it',
-          '- If several approaches work, list them with the tradeoffs',
-        ],
-      },
-    };
-
-    /**
-     * Turn a free-form draft into a structured prompt.
-     * Local rules only: no network, no model call, no imports.
-     * @param {string} raw
-     * @returns {string}
-     */
-    function optimize(raw) {
-      const text = String(raw ?? '').trim();
-      if (text === '') return '';
-
-      // A bare acknowledgement is not an instruction: hand it back untouched so
-      // the caller can tell the user there is nothing to restructure.
-      if (isTrivial(text)) return '';
-
-      const zh = languageOf(text) === 'zh';
-      const head = zh ? HEADINGS.zh : HEADINGS.en;
-      const parts = fragments(text);
-
-      // The first fragment carries the goal unless it is a bare constraint.
-      let goal = (parts[0] ?? text).replace(/[：:]\s*$/u, '');
-      let rest = parts.slice(1);
-      if (isConstraint(goal, zh) && rest.length > 0) {
-        goal = rest[0].replace(/[：:]\s*$/u, '');
-        rest = parts.filter((_, index) => index !== 1).slice(1);
-      }
-      if (goal === '') goal = text.replace(/[：:]\s*$/u, '');
-
-      const requirements = [];
-      const constraints = [];
-      for (const part of rest) {
-        if (isConstraint(part, zh)) constraints.push(part);
-        else requirements.push(part);
-      }
-
-      const intent = classify(text);
-      const out = [head.goal, goal];
-
-      if (requirements.length > 0) {
-        out.push('', head.requirements);
-        for (const line of requirements) out.push(`- ${line}`);
-      }
-      if (constraints.length > 0) {
-        out.push('', head.constraints);
-        for (const line of constraints) out.push(`- ${line}`);
-      }
-
-      out.push('', head.output);
-      for (const line of (zh ? OUTPUT_RULES.zh : OUTPUT_RULES.en)[intent]) out.push(line);
-
-      return out.join('\n');
+      return TRIVIAL.some((w) => {
+        const c = w.replace(/[\s。！？!?.,，、~～…—-]+/gu, '');
+        return c !== '' && compact === c;
+      });
     }
 
     /* ── inline styles ────────────────────────────────────────────────────── */
 
-    /**
-     * A plugin factory gets no `styles` builtin — only `React`, `require`,
-     * `ctx` and `console`. Every visual property is therefore an inline React
-     * style object, which also keeps cleanup automatic on unmount.
-     */
     const S = {
       wrap: { display: 'flex', alignItems: 'center' },
       button: {
@@ -265,12 +89,8 @@ window.__ModuleLoader__.load({
         whiteSpace: 'nowrap',
         transition: 'background .15s ease, color .15s ease, border-color .15s ease',
       },
-      buttonDone: {
-        color: 'var(--dsw-alias-text-success, #0a8f3c)',
-        borderColor: 'currentColor',
-      },
+      buttonDone: { color: 'var(--dsw-alias-text-success, #0a8f3c)', borderColor: 'currentColor' },
       buttonDisabled: { opacity: '.45', cursor: 'default' },
-      icon: { flex: 'none' },
     };
 
     /* ── component ────────────────────────────────────────────────────────── */
@@ -286,10 +106,33 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
+    /**
+     * Resolve the session's model route from its projections.
+     * @param {object} pluginCtx
+     * @param {string} sessionId
+     * @returns {{ provider: string, model: string } | undefined}
+     */
+    function resolveRoute(pluginCtx, sessionId) {
+      const binding = pluginCtx?.get?.('sessions')?.binding?.(sessionId);
+      const face = binding?.session?.projections?.faceOf?.('modelSelection');
+      const state = face?.get?.();
+      const next = state?.next ?? state?.current;
+      if (next !== undefined && typeof next.provider === 'string' && typeof next.model === 'string') {
+        return { provider: next.provider, model: next.model };
+      }
+
+      const catalog = pluginCtx?.get?.('remote')?.session?.modelCatalog?.();
+      const fallback = catalog?.value?.default;
+      if (fallback !== undefined && typeof fallback.provider === 'string' && typeof fallback.model === 'string') {
+        return { provider: fallback.provider, model: fallback.model };
+      }
+      return undefined;
+    }
+
     function iconIdle() {
       return h(
         'svg',
-        { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
+        { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true, style: { flex: 'none' } },
         h('path', {
           d: 'M8 1.5 9.4 5.6 13.5 7 9.4 8.4 8 12.5 6.6 8.4 2.5 7 6.6 5.6Z',
           fill: 'currentColor',
@@ -305,13 +148,28 @@ window.__ModuleLoader__.load({
     function iconDone() {
       return h(
         'svg',
-        { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
+        { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true, style: { flex: 'none' } },
         h('path', {
           d: 'M3 8.5 6.2 11.7 13 4.9',
           stroke: 'currentColor',
           strokeWidth: '1.7',
           strokeLinecap: 'round',
           strokeLinejoin: 'round',
+        }),
+      );
+    }
+
+    function iconBusy() {
+      return h(
+        'svg',
+        { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true, style: { flex: 'none' } },
+        h('circle', {
+          cx: 8, cy: 8, r: 5.5,
+          stroke: 'currentColor', strokeWidth: '1.7', strokeOpacity: '.25',
+        }),
+        h('path', {
+          d: 'M8 2.5A5.5 5.5 0 0 1 13.5 8',
+          stroke: 'currentColor', strokeWidth: '1.7', strokeLinecap: 'round',
         }),
       );
     }
@@ -340,6 +198,7 @@ window.__ModuleLoader__.load({
       const copy = copyFor(readLocale(pluginCtx));
       const draft = props.useInput((state) => state?.draft) ?? '';
       const empty = String(draft).trim() === '';
+      const busy = phase === 'busy';
 
       const flash = React.useCallback((next, message) => {
         setPhase(next);
@@ -354,36 +213,43 @@ window.__ModuleLoader__.load({
 
       const run = React.useCallback(() => {
         const text = String(draft ?? '');
-        if (text.trim() === '') {
-          flash('error', copy.empty);
-          return;
-        }
-        if (text.length > MAX_DRAFT) {
-          flash('error', copy.tooLong);
-          return;
-        }
+        if (text.trim() === '') return flash('error', copy.empty);
+        if (text.length > MAX_DRAFT) return flash('error', copy.tooLong);
+        if (isTrivial(text)) return flash('error', copy.trivial);
         if (sessionId === undefined || typeof inputActions?.setDraft !== 'function') {
-          flash('error', copy.noSession);
-          return;
+          return flash('error', copy.noSession);
         }
-        const next = optimize(text);
-        if (next === '') {
-          // Not an instruction — leave the draft alone and say why.
-          flash('error', copy.trivial);
-          return;
-        }
-        inputActions.setDraft(next);
-        flash('done', copy.tipDone);
-      }, [draft, copy, sessionId, inputActions, flash]);
 
-      const label = phase === 'done' ? copy.done : copy.idle;
+        const route = resolveRoute(pluginCtx, sessionId);
+        if (route === undefined) return flash('error', copy.noRoute);
+
+        if (timer.current !== undefined) clearTimeout(timer.current);
+        setNote('');
+        setPhase('busy');
+
+        void (async () => {
+          try {
+            const remote = pluginCtx.get('remote');
+            const next = await remote.promptOptimizer.optimize(text, route.provider, route.model);
+            if (!mounted.current) return;
+            if (typeof next !== 'string' || next.trim() === '') throw new Error(copy.failed);
+            inputActions.setDraft(next);
+            flash('done', copy.tipDone);
+          } catch (error) {
+            if (!mounted.current) return;
+            const reason = error instanceof Error && error.message !== '' ? error.message : copy.failed;
+            flash('error', reason);
+          }
+        })();
+      }, [draft, copy, sessionId, inputActions, pluginCtx, flash]);
+
+      const label = busy ? copy.busy : phase === 'done' ? copy.done : copy.idle;
       const tooltip = note !== '' ? note : copy.tip;
-
       const buttonStyle = Object.assign(
         {},
         S.button,
         phase === 'done' ? S.buttonDone : undefined,
-        empty ? S.buttonDisabled : undefined,
+        empty || busy ? S.buttonDisabled : undefined,
       );
 
       return h(
@@ -399,11 +265,12 @@ window.__ModuleLoader__.load({
             'data-dsh-prompt-optimizer': 'button',
             title: tooltip,
             'aria-label': label,
-            disabled: empty,
+            'aria-busy': busy ? 'true' : undefined,
+            disabled: empty || busy,
             onMouseDown: (event) => event.preventDefault(),
             onClick: run,
           },
-          phase === 'done' ? iconDone() : iconIdle(),
+          busy ? iconBusy() : phase === 'done' ? iconDone() : iconIdle(),
           h('span', null, label),
         ),
       );
@@ -411,11 +278,78 @@ window.__ModuleLoader__.load({
 
     /* ── plugin ───────────────────────────────────────────────────────────── */
 
+    /**
+     * Build the Remote contribution by hand.
+     *
+     * The Client factory can only `require('react')` — no `@deepseek-ai/*` and no
+     * `zod`. The Gateway's `validateContribution` therefore only inspects the
+     * descriptor shape (`codec.mode === 'strict'`, namespace/method names), so a
+     * plain object carrying those fields mounts exactly like a generated one.
+     * The Host half holds the real zod-backed declaration; the wire is JSON, so
+     * the two sides only have to agree on names and arity.
+     */
+    function buildContribution() {
+      const ENDPOINT = 'promptOptimizer/optimize';
+      const strictCodec = (name) => ({
+        mode: 'strict',
+        typeSymbol: `dsh-prompt-optimizer#${ENDPOINT}:${name}`,
+        create: () => undefined,
+        jsonSchema: { type: 'string' },
+      });
+      const parameter = (name) => ({
+        name,
+        wire: name,
+        description: name,
+        source: 'json',
+        codec: strictCodec(name),
+        strictCodec: strictCodec(name),
+      });
+
+      const descriptor = {
+        id: `dsh-prompt-optimizer#${ENDPOINT}`,
+        namespace: 'promptOptimizer',
+        method: 'optimize',
+        service: 'promptOptimizer',
+        description: 'Rewrite one composer draft into a structured prompt.',
+        invocation: { kind: 'direct' },
+        parameters: [parameter('draft'), parameter('provider'), parameter('model')],
+        cancellation: { parameter: 'signal' },
+        result: {
+          mode: 'strict',
+          typeSymbol: 'dsh-prompt-optimizer#RewrittenPrompt',
+          create: () => undefined,
+          description: 'the rewritten prompt text',
+          jsonSchema: { type: 'string' },
+        },
+      };
+
+      return {
+        package: 'dsh-prompt-optimizer',
+        descriptors: [descriptor],
+        methods: { [ENDPOINT]: descriptor },
+      };
+    }
+
     return {
       name: 'dsh-prompt-optimizer',
-      inject: ['slots'],
+      /** `remote` mounts the namespace; `slots` places the button. */
+      inject: ['remote', 'slots'],
       apply(ctx) {
         live.ctx = ctx;
+
+        // Mount the Remote namespace so `ctx.remote.promptOptimizer.optimize`
+        // resolves. A failure here must not take the button down with it: the
+        // button then reports no route instead of disappearing.
+        const remote = ctx.get('remote');
+        if (remote !== undefined && typeof remote.$mount === 'function') {
+          ctx.effect(
+            () => remote.$mount(buildContribution()),
+            'prompt-optimizer: mount remote namespace',
+          );
+        } else {
+          console.error('[prompt-optimizer] the remote service is unavailable; the button will report no route');
+        }
+
         ctx.slots.inject(SLOT, () =>
           ctx.slots.register({ name: SLOT, id: CELL, order: 30 }, OptimizerButton),
         );

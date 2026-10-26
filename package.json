@@ -25,6 +25,9 @@
   "engines": {
     "node": ">=20"
   },
+  "dependencies": {
+    "zod": "^4.0.0"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
